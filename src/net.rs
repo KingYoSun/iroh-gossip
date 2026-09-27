@@ -533,6 +533,16 @@ impl Actor {
             }
         };
 
+        // The peer closes a connection it stopped sending on once we keep no
+        // stream open on it for `IDLE_GRACE`. When this connection supersedes
+        // another, our streams to the peer are all on the old one, and a quiet
+        // topic opens none here. Reopen the streams of the topics we share.
+        let topics = self
+            .topics
+            .iter()
+            .filter(|(_, state)| state.neighbors.contains(&peer_id))
+            .map(|(topic, _)| *topic)
+            .collect();
         let max_message_size = self.state.max_message_size();
         let in_event_tx = self.in_event_tx.clone();
 
@@ -546,6 +556,7 @@ impl Actor {
                     send_rx,
                     in_event_tx,
                     max_message_size,
+                    topics,
                     queue,
                 )
                 .await;
@@ -892,6 +903,7 @@ impl<T> From<mpsc::error::SendError<T>> for ConnectionLoopError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     from: PublicKey,
     conn: Connection,
@@ -899,6 +911,7 @@ async fn connection_loop(
     send_rx: mpsc::Receiver<ProtoMessage>,
     in_event_tx: mpsc::Sender<InEvent>,
     max_message_size: usize,
+    topics: Vec<TopicId>,
     queue: Vec<ProtoMessage>,
 ) -> Result<(), ConnectionLoopError> {
     debug!(?origin, "connection established");
@@ -910,7 +923,7 @@ async fn connection_loop(
     // is done.
     let (send_done_tx, send_done_rx) = oneshot::channel();
     let send_fut = async {
-        let res = send_loop.run(queue).await;
+        let res = send_loop.run(topics, queue).await;
         send_done_tx.send(()).ok();
         res
     }
@@ -1648,7 +1661,7 @@ pub(crate) mod tests {
         drop(send_tx);
 
         let mut send_loop = SendLoop::new(conn, send_rx, 1024);
-        timeout(Duration::from_secs(5), send_loop.run(vec![]))
+        timeout(Duration::from_secs(5), send_loop.run(vec![], vec![]))
             .await
             .std_context("send loop did not stop")?
             .std_context("send loop")?;

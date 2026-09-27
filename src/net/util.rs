@@ -235,6 +235,20 @@ impl RecvStreamState {
     }
 }
 
+/// Opens a stream for `topic_id` and writes its header.
+async fn open_stream(
+    conn: &Connection,
+    topic_id: TopicId,
+    buffer: &mut Vec<u8>,
+    max_message_size: usize,
+) -> Result<SendStream, WriteError> {
+    let mut stream = conn.open_uni().await?;
+    let header = StreamHeader { topic_id };
+    header.write(&mut stream, buffer, max_message_size).await?;
+    debug!(topic=%topic_id.fmt_short(), "stream opened");
+    Ok(stream)
+}
+
 pub(crate) struct SendLoop {
     conn: Connection,
     streams: HashMap<TopicId, SendStream>,
@@ -260,7 +274,24 @@ impl SendLoop {
         }
     }
 
-    pub(crate) async fn run(&mut self, queue: Vec<ProtoMessage>) -> Result<(), WriteError> {
+    /// Opens a stream for each of `topics`, then sends `queue` and what the actor sends next.
+    ///
+    /// Opening the streams up front tells the peer that we use this connection now.
+    pub(crate) async fn run(
+        &mut self,
+        topics: Vec<TopicId>,
+        queue: Vec<ProtoMessage>,
+    ) -> Result<(), WriteError> {
+        for topic_id in topics {
+            let stream = open_stream(
+                &self.conn,
+                topic_id,
+                &mut self.buffer,
+                self.max_message_size,
+            )
+            .await?;
+            self.streams.insert(topic_id, stream);
+        }
         for msg in queue {
             self.write_message(&msg).await?;
         }
@@ -321,15 +352,15 @@ impl SendLoop {
 
         let mut entry = match self.streams.entry(topic_id) {
             hash_map::Entry::Occupied(entry) => entry,
-            hash_map::Entry::Vacant(entry) => {
-                let mut stream = self.conn.open_uni().await?;
-                let header = StreamHeader { topic_id };
-                header
-                    .write(&mut stream, &mut self.buffer, self.max_message_size)
-                    .await?;
-                debug!(topic=%topic_id.fmt_short(), "stream opened");
-                entry.insert_entry(stream)
-            }
+            hash_map::Entry::Vacant(entry) => entry.insert_entry(
+                open_stream(
+                    &self.conn,
+                    topic_id,
+                    &mut self.buffer,
+                    self.max_message_size,
+                )
+                .await?,
+            ),
         };
         let stream = entry.get_mut();
 
