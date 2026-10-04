@@ -400,6 +400,14 @@ where
     }
 
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
+        // A join is the first message of a membership, so a `Neighbor` we sent to
+        // this peer before it is not going to be answered: either the peer took our
+        // renewal for a reply when it re-subscribed, or the process that received
+        // it is gone and this is its successor on the same id, whose connection
+        // superseded the old one before we saw that one close. `send_neighbor`
+        // sends nothing while such a request is pending, so forget it here: the
+        // peer is waiting for the `Neighbor` that tells it it has joined.
+        self.pending_neighbor_requests.remove(&peer);
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
         self.add_active(peer, data.clone(), Priority::High, true, io);
@@ -839,6 +847,45 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    fn neighbors_sent(io: &Io, peer: u32) -> usize {
+        io.iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TopicOut::SendMessage(to, topic::Message::Swarm(Message::Neighbor(_))) if *to == peer
+                )
+            })
+            .count()
+    }
+
+    /// A join is answered while an earlier `Neighbor` to the peer is still pending.
+    ///
+    /// A neighbor that re-subscribes joins again, and takes the `Neighbor` we
+    /// renew with for a reply, so our request stays pending. When that peer then
+    /// starts over on the same id and we did not see its old connection close,
+    /// its join must still be answered, or it never learns that it has joined.
+    #[test]
+    fn join_is_answered_while_an_earlier_neighbor_request_is_pending() {
+        let mut state = new_state();
+        let io = &mut Io::new();
+        state.handle(InEvent::RecvMessage(1, Message::Join(None)), io);
+        assert_eq!(neighbors_sent(io, 1), 1);
+        let reply = Neighbor {
+            priority: Priority::High,
+            data: None,
+        };
+        state.handle(InEvent::RecvMessage(1, Message::Neighbor(reply)), io);
+        assert!(state.pending_neighbor_requests.is_empty());
+        state.handle(InEvent::RecvMessage(1, Message::Join(None)), io);
+        assert_eq!(neighbors_sent(io, 1), 2);
+        assert!(state.pending_neighbor_requests.contains(&1));
+
+        state.handle(InEvent::RecvMessage(1, Message::Join(None)), io);
+
+        assert_eq!(neighbors_sent(io, 1), 3, "the join was not answered");
+        assert!(state.active_view.contains(&1));
     }
 
     /// A join lost to a closed connection is retried a bounded number of times.
